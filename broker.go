@@ -2,6 +2,7 @@ package sarama
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -19,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
@@ -93,6 +96,8 @@ const (
 	SASLExtKeyAuth = "auth"
 
 	IAMAuthVersion = "2020_10_22"
+
+	emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
 // AccessToken contains an access token used to authenticate a
@@ -442,7 +447,7 @@ func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error
 	return b.sendWithPromise(request, promise)
 }
 
-//Produce returns a produce response or error
+// Produce returns a produce response or error
 func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 	var (
 		response *ProduceResponse
@@ -1215,14 +1220,14 @@ func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int
 // In SASL Plain, Kafka expects the auth header to be in the following format
 // Message format (from https://tools.ietf.org/html/rfc4616):
 //
-//   message   = [authzid] UTF8NUL authcid UTF8NUL passwd
-//   authcid   = 1*SAFE ; MUST accept up to 255 octets
-//   authzid   = 1*SAFE ; MUST accept up to 255 octets
-//   passwd    = 1*SAFE ; MUST accept up to 255 octets
-//   UTF8NUL   = %x00 ; UTF-8 encoded NUL character
+//	message   = [authzid] UTF8NUL authcid UTF8NUL passwd
+//	authcid   = 1*SAFE ; MUST accept up to 255 octets
+//	authzid   = 1*SAFE ; MUST accept up to 255 octets
+//	passwd    = 1*SAFE ; MUST accept up to 255 octets
+//	UTF8NUL   = %x00 ; UTF-8 encoded NUL character
 //
-//   SAFE      = UTF1 / UTF2 / UTF3 / UTF4
-//                  ;; any UTF-8 encoded Unicode character except NUL
+//	SAFE      = UTF1 / UTF2 / UTF3 / UTF4
+//	               ;; any UTF-8 encoded Unicode character except NUL
 //
 // With SASL v0 handshake and auth then:
 // When credentials are valid, Kafka returns a 4 byte array of null characters.
@@ -1797,16 +1802,13 @@ func (b *Broker) sendAndReceiveSASLIAM() error {
 		return err
 	}
 
-	msg, err := getIAMPayload(
-		b.addr,
-		b.conf.ClientID,
-		b.conf.Net.SASL.AWSMSKIAM,
-	)
+	ctx := context.TODO()
+	requestTime := time.Now()
+	msg, err := GetIAMPayload(ctx, b.addr, b.conf.ClientID, requestTime)
 	if err != nil {
-		return err
+		return fmt.Errorf("generating AWS_MSK_IAM authentication payload: %w", err)
 	}
 
-	requestTime := time.Now()
 	// Will be decremented in updateIncomingCommunicationMetrics (except error)
 	b.addRequestInFlightMetrics(1)
 	correlationID := b.correlationID
@@ -1913,6 +1915,72 @@ func getIAMPayload(addr, useragent string, cfg AWSMSKIAMConfig) ([]byte, error) 
 	}
 
 	for key, vals := range req.URL.Query() {
+		payload[strings.ToLower(key)] = vals[0]
+	}
+
+	return json.Marshal(payload)
+}
+
+// GetIAMPayload generates an AWS_MSK_IAM authentication request for
+// authenticating against an AWS MSK cluster.
+func GetIAMPayload(ctx context.Context, addr, useragent string, t time.Time) ([]byte, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	var action = "kafka-cluster:Connect"
+
+	q := url.Values{
+		"Action":        {action},
+		"X-Amz-Expires": {"900"},
+	}
+
+	u := url.URL{
+		Scheme:   "kafka",
+		Host:     host,
+		Path:     "/",
+		RawQuery: q.Encode(),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	conf, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("loading AWS SDK config: %w", err)
+	}
+
+	signer := v4.NewSigner()
+	creds, err := conf.Credentials.Retrieve(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("obtaining AWS credentials: %w", err)
+	}
+
+	signedUrlString, header, err := signer.PresignHTTP(
+		ctx, creds, req, emptyPayloadHash, "kafka-cluster", conf.Region, t,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pre-signing canonical request: %w", err)
+	}
+
+	signedUrl, err := url.Parse(signedUrlString)
+	if err != nil {
+		return nil, fmt.Errorf("parsing signed URL: %w", err)
+	}
+
+	payload := map[string]string{
+		"version":    IAMAuthVersion,
+		"user-agent": useragent,
+	}
+
+	for key, vals := range header {
+		payload[strings.ToLower(key)] = vals[0]
+	}
+
+	for key, vals := range signedUrl.Query() {
 		payload[strings.ToLower(key)] = vals[0]
 	}
 
